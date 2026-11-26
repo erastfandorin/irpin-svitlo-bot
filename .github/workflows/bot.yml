@@ -1,24 +1,35 @@
 name: outage-bot
 
+# Бот працює безперервно: кожен запуск триває ~55 хв (long polling — миттєві відповіді
+# на команди), на старті ставить у чергу наступний запуск, тож вони йдуть один за одним.
+# Cron — лише страховка, якщо ланцюжок колись обірветься.
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
-# Лише один запуск одночасно, щоб не дублювати сповіщення.
+# Лише один запуск одночасно; наступний чекає в черзі (pending), поки поточний не завершиться.
 concurrency:
   group: outage-bot
   cancel-in-progress: false
 
 permissions:
   contents: read
-  actions: write # кеш стану + підтримка cron активним
+  actions: write # кеш стану, запуск наступного циклу, підтримка cron активним
+
+env:
+  LOOP_MINUTES: "55"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 75
     steps:
+      - name: Queue next run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" || true
+
       - uses: actions/checkout@v4
 
       - name: Restore state
@@ -31,7 +42,7 @@ jobs:
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: python3 bot.py
+        run: python3 bot.py --loop "$LOOP_MINUTES"
 
       - name: Save state
         if: always()
@@ -48,7 +59,5 @@ jobs:
           # прибрати старі кеші стану (лишаємо 5 найновіших)
           gh cache list -R "$GITHUB_REPOSITORY" --key bot-state- --sort created_at --order desc -L 100 --json id -q '.[5:][].id' \
             | xargs -r -n1 gh cache delete -R "$GITHUB_REPOSITORY" || true
-          # раз на добу «будимо» workflow, щоб GitHub не вимкнув cron через 60 днів без комітів
-          if [ "$(date -u +%H)" = "03" ] && [ "$(date -u +%M)" -lt 10 ]; then
-            gh workflow enable bot.yml -R "$GITHUB_REPOSITORY" || true
-          fi
+          # «будимо» workflow, щоб GitHub не вимкнув cron через 60 днів без комітів
+          gh workflow enable bot.yml -R "$GITHUB_REPOSITORY" || true

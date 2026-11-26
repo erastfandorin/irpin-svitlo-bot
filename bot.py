@@ -12,6 +12,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -64,7 +65,7 @@ def tg(method, **params):
     data = urllib.parse.urlencode({k: (json.dumps(v) if isinstance(v, (dict, list)) else v) for k, v in params.items()}).encode()
     req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}", data=data)
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=int(params.get("timeout", 0)) + 20) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:
         try:
@@ -78,12 +79,23 @@ def send(state, chat_id, text):
         print(f"\n--- → {chat_id}\n{text}\n", flush=True)
         return True
     res = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview="true")
+    new_id = (res.get("parameters") or {}).get("migrate_to_chat_id")
+    if new_id:  # групу перетворено на супергрупу — у неї новий id
+        migrate(state, chat_id, new_id)
+        return send(state, new_id, text)
     if not res.get("ok"):
         log("sendMessage failed:", chat_id, res.get("error_code"), res.get("description"))
-        if res.get("error_code") == 403 and chat_id in state["subscribers"]:  # користувач заблокував бота
+        if res.get("error_code") == 403 and chat_id in state["subscribers"]:  # бота заблокували / видалили з групи
             state["subscribers"].remove(chat_id)
         return False
     return True
+
+
+def migrate(state, old_id, new_id):
+    subs = state["subscribers"]
+    if old_id in subs:
+        subs[subs.index(old_id)] = new_id
+    log("chat migrated", old_id, "->", new_id)
 
 
 def broadcast(state, text):
@@ -269,37 +281,78 @@ def day_message(days, day, title):
     return f"🗓 <b>{title}, {fmt_day(day)}</b>\nГрафік ще не опубліковано. Надішлю, щойно з'явиться."
 
 
-def handle_updates(state, days, now):
-    res = tg("getUpdates", offset=state["offset"], timeout=0, allowed_updates=["message"])
+def subscribe(state, chat_id, days, now, group=False):
+    if chat_id not in state["subscribers"]:
+        state["subscribers"].append(chat_id)
+    where = "для цієї групи" if group else ""
+    send(state, chat_id,
+         f"👋 Підписка оформлена{(' ' + where) if where else ''}: черга <b>{GROUP_LABEL}</b>, {PLACE}.\n\n"
+         f"Я надсилатиму графік на завтра, щойно його опублікують, і нагадуватиму "
+         f"за 30 хв до відключення та за 30 хв до включення.\n\n{HELP}")
+    send(state, chat_id, day_message(days, now.date(), "Сьогодні"))
+    tomorrow = now.date() + timedelta(days=1)
+    if tomorrow in days:
+        send(state, chat_id, day_message(days, tomorrow, "Графік на завтра"))
+
+
+def unsubscribe(state, chat_id):
+    if chat_id in state["subscribers"]:
+        state["subscribers"].remove(chat_id)
+
+
+COMMANDS = {"/start", "/stop", "/today", "/tomorrow", "/now", "/help"}
+
+
+def handle_member_update(state, days, now, upd):
+    """Бота додали в групу / видалили з неї / заблокували в приваті."""
+    chat = upd.get("chat") or {}
+    chat_id, is_group = chat.get("id"), chat.get("type") in ("group", "supergroup")
+    old = (upd.get("old_chat_member") or {}).get("status")
+    new = (upd.get("new_chat_member") or {}).get("status")
+    log("membership", chat.get("type"), old, "->", new)
+    if new in ("left", "kicked"):
+        unsubscribe(state, chat_id)
+    elif is_group and new in ("member", "administrator") and old in ("left", "kicked", None):
+        subscribe(state, chat_id, days, now, group=True)
+
+
+def handle_updates(state, days, now, poll=0):
+    """poll > 0 — long polling: чекає нових повідомлень до poll секунд і відповідає одразу."""
+    res = tg("getUpdates", offset=state["offset"], timeout=poll, allowed_updates=["message", "my_chat_member"])
     if not res.get("ok"):
         log("getUpdates failed:", res.get("description"))
         return
     if not state.get("bot_username"):
         me = tg("getMe")
         state["bot_username"] = (me.get("result") or {}).get("username")
-    log(f"bot=@{state.get('bot_username')} updates={len(res['result'])}")
+        log(f"bot=@{state['bot_username']}")
+    if res["result"]:
+        log(f"updates={len(res['result'])}")
     for upd in res["result"]:
         state["offset"] = upd["update_id"] + 1
+        if upd.get("my_chat_member"):
+            handle_member_update(state, days, now, upd["my_chat_member"])
+            continue
         msg = upd.get("message") or {}
-        chat_id = (msg.get("chat") or {}).get("id")
+        chat = msg.get("chat") or {}
+        chat_id, is_group = chat.get("id"), chat.get("type") in ("group", "supergroup")
+        if msg.get("migrate_to_chat_id"):
+            migrate(state, chat_id, msg["migrate_to_chat_id"])
+            continue
         text = (msg.get("text") or "").strip()
         if not chat_id or not text.startswith("/"):
             continue
-        cmd = text.split()[0].split("@")[0].lower()
+        cmd, _, addressee = text.split()[0].lower().partition("@")
+        me = (state.get("bot_username") or "").lower()
+        if addressee and me and addressee != me:
+            continue  # команда для іншого бота в групі
+        if is_group and cmd not in COMMANDS:
+            continue  # у групі не реагуємо на чужі команди
         today, tomorrow = now.date(), now.date() + timedelta(days=1)
         if cmd == "/start":
-            if chat_id not in state["subscribers"]:
-                state["subscribers"].append(chat_id)
-            send(state, chat_id,
-                 f"👋 Підписка оформлена: черга <b>{GROUP_LABEL}</b>, {PLACE}.\n\n"
-                 f"Я надсилатиму графік на завтра, щойно його опублікують, і нагадуватиму "
-                 f"за 30 хв до відключення та за 30 хв до включення.\n\n{HELP}")
-            send(state, chat_id, day_message(days, today, "Сьогодні"))
-            if tomorrow in days:
-                send(state, chat_id, day_message(days, tomorrow, "Графік на завтра"))
+            subscribe(state, chat_id, days, now, group=is_group)
         elif cmd == "/stop":
-            if chat_id in state["subscribers"]:
-                state["subscribers"].remove(chat_id)
+            unsubscribe(state, chat_id)
             send(state, chat_id, "🔕 Сповіщення вимкнено. /start — увімкнути знову.")
         elif cmd == "/today":
             send(state, chat_id, day_message(days, today, "Сьогодні"))
@@ -336,20 +389,26 @@ def check_schedule_changes(state, days, now):
             del state["days"][key]
 
 
-def due_warnings(state, days, now):
+def due_warnings(state, days, now, lookahead=LOOKAHEAD):
     evs, data_end = events(days)
     due = []
     for ev in evs:
         key = f"{ev['type']}:{ev['at'].isoformat()}"
         notify_at = ev["at"] - WARN_BEFORE
-        if key in state["notified"] or ev["at"] <= now or notify_at > now + LOOKAHEAD:
+        if key in state["notified"] or ev["at"] <= now or notify_at > now + lookahead:
             continue
         due.append((notify_at, key, ev))
     return sorted(due, key=lambda x: x[0]), evs, data_end
 
 
-def send_warnings(state, days, now_fn, sleep=True):
-    due, evs, data_end = due_warnings(state, days, now_fn())
+def next_warning_at(state, days, now):
+    """Найближчий момент, коли треба надіслати нагадування (або None)."""
+    due, _, _ = due_warnings(state, days, now, lookahead=timedelta(days=3))
+    return due[0][0] if due else None
+
+
+def send_warnings(state, days, now_fn, sleep=True, lookahead=LOOKAHEAD):
+    due, evs, data_end = due_warnings(state, days, now_fn(), lookahead)
     for notify_at, key, ev in due:
         wait = (notify_at - now_fn()).total_seconds()
         if wait > 0:
@@ -368,12 +427,56 @@ def send_warnings(state, days, now_fn, sleep=True):
     state["notified"] = {k: v for k, v in state["notified"].items() if v >= cutoff}
 
 
+DATA_TTL = timedelta(minutes=int(os.environ.get("DATA_TTL_MIN", "5")))
+MAX_POLL = 25  # секунд одного long-poll запиту
+
+
+def run_loop(state, days, now_fn, duration):
+    """Безперервна робота: відповідає на команди одразу, графік оновлює раз на DATA_TTL,
+    нагадування надсилає точно в момент «за 30 хв»."""
+    deadline = now_fn() + duration
+    fetched_at = now_fn()
+    check_schedule_changes(state, days, now_fn())
+    save_state(state)
+    log(f"loop started until {deadline:%H:%M}")
+    while now_fn() < deadline:
+        try:
+            if now_fn() - fetched_at >= DATA_TTL:
+                fetched_at = now_fn()
+                try:
+                    fresh = build_slots(fetch_data())
+                    if fresh:
+                        days = fresh
+                        check_schedule_changes(state, days, now_fn())
+                except Exception as e:  # дані недоступні — працюємо зі старими
+                    log("fetch failed:", e)
+            send_warnings(state, days, now_fn, sleep=False, lookahead=timedelta(0))
+            now = now_fn()
+            wake = [deadline, fetched_at + DATA_TTL]
+            nw = next_warning_at(state, days, now)
+            if nw:
+                wake.append(nw)
+            poll = math.ceil(max(0, min(MAX_POLL, (min(wake) - now).total_seconds())))
+            before = (state["offset"], list(state["subscribers"]))
+            handle_updates(state, days, now, poll=poll)
+            if (state["offset"], state["subscribers"]) != before:
+                save_state(state)
+        except Exception as e:
+            log("loop error:", repr(e))
+            time.sleep(5)
+    save_state(state)
+    log(f"loop finished: subscribers={len(state['subscribers'])}")
+    return 0
+
+
 def main():
     global DRY_RUN
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="друкувати повідомлення замість надсилання")
     ap.add_argument("--now", help="імітувати поточний час, напр. 2026-11-27T06:00 (лише з --dry-run)")
     ap.add_argument("--preview", action="store_true", help="лише показати графік і події")
+    ap.add_argument("--loop", type=float, metavar="MIN",
+                    help="працювати безперервно MIN хвилин: миттєві відповіді на команди (long polling)")
     args = ap.parse_args()
     DRY_RUN = args.dry_run or args.preview
 
@@ -401,6 +504,8 @@ def main():
         return 0
 
     state = load_state()
+    if args.loop:
+        return run_loop(state, days, now_fn, timedelta(minutes=args.loop))
     if args.dry_run and not state["subscribers"]:
         state["subscribers"] = ["dry-run"]
     if not DRY_RUN:
