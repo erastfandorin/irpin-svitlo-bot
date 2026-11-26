@@ -274,6 +274,10 @@ def handle_updates(state, days, now):
     if not res.get("ok"):
         log("getUpdates failed:", res.get("description"))
         return
+    if not state.get("bot_username"):
+        me = tg("getMe")
+        state["bot_username"] = (me.get("result") or {}).get("username")
+    log(f"bot=@{state.get('bot_username')} updates={len(res['result'])}")
     for upd in res["result"]:
         state["offset"] = upd["update_id"] + 1
         msg = upd.get("message") or {}
