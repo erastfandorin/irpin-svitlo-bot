@@ -31,6 +31,8 @@ jobs:
         run: gh workflow run bot.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" || true
 
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }} # свіжий код гілки, а не коміт на момент постановки в чергу
 
       - name: Restore state
         uses: actions/cache/restore@v4

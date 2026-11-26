@@ -74,19 +74,41 @@ def tg(method, **params):
             return {"ok": False, "error_code": e.code, "description": str(e)}
 
 
-def send(state, chat_id, text):
+BUTTONS = {"inline_keyboard": [[
+    {"text": "📅 Сьогодні", "callback_data": "today"},
+    {"text": "📅 Завтра", "callback_data": "tomorrow"},
+    {"text": "💡 Зараз", "callback_data": "now"},
+]]}
+
+
+def thread_of(state, chat_id):
+    return state.setdefault("threads", {}).get(str(chat_id))
+
+
+def send(state, chat_id, text, thread=None, buttons=True):
+    """thread — id топіка у форумі (None — основний чат / General)."""
     if DRY_RUN:
-        print(f"\n--- → {chat_id}\n{text}\n", flush=True)
+        print(f"\n--- → {chat_id}{'#' + str(thread) if thread else ''}\n{text}\n", flush=True)
         return True
-    res = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview="true")
+    params = dict(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview="true")
+    if thread:
+        params["message_thread_id"] = thread
+    if buttons:
+        params["reply_markup"] = BUTTONS
+    res = tg("sendMessage", **params)
     new_id = (res.get("parameters") or {}).get("migrate_to_chat_id")
     if new_id:  # групу перетворено на супергрупу — у неї новий id
         migrate(state, chat_id, new_id)
-        return send(state, new_id, text)
+        return send(state, new_id, text, thread, buttons)
     if not res.get("ok"):
-        log("sendMessage failed:", chat_id, res.get("error_code"), res.get("description"))
+        desc = res.get("description") or ""
+        log("sendMessage failed:", chat_id, thread, res.get("error_code"), desc)
+        if thread and "thread" in desc.lower():  # топік видалили — пишемо в основний чат
+            if thread_of(state, chat_id) == thread:
+                state["threads"].pop(str(chat_id), None)
+            return send(state, chat_id, text, None, buttons)
         if res.get("error_code") == 403 and chat_id in state["subscribers"]:  # бота заблокували / видалили з групи
-            state["subscribers"].remove(chat_id)
+            unsubscribe(state, chat_id)
         return False
     return True
 
@@ -95,12 +117,15 @@ def migrate(state, old_id, new_id):
     subs = state["subscribers"]
     if old_id in subs:
         subs[subs.index(old_id)] = new_id
+    threads = state.setdefault("threads", {})
+    if str(old_id) in threads:
+        threads[str(new_id)] = threads.pop(str(old_id))
     log("chat migrated", old_id, "->", new_id)
 
 
-def broadcast(state, text):
+def broadcast(state, text, buttons=True):
     for chat_id in list(state["subscribers"]):
-        send(state, chat_id, text)
+        send(state, chat_id, text, thread_of(state, chat_id), buttons)
 
 
 # ---------------------------------------------------------------- Графік
@@ -271,8 +296,25 @@ HELP = (
     "/today — графік на сьогодні\n"
     "/tomorrow — графік на завтра\n"
     "/now — чи є зараз світло за графіком\n"
+    "/start — надсилати сповіщення сюди (у групі — в цей топік)\n"
     "/stop — відписатися від сповіщень"
 )
+
+BOT_COMMANDS = [
+    {"command": "today", "description": "графік на сьогодні"},
+    {"command": "tomorrow", "description": "графік на завтра"},
+    {"command": "now", "description": "чи є зараз світло за графіком"},
+    {"command": "start", "description": "надсилати сповіщення сюди"},
+    {"command": "stop", "description": "вимкнути сповіщення"},
+]
+
+
+def setup_commands():
+    """Меню команд для приватних чатів і груп (у т.ч. топіків)."""
+    for scope in ({"type": "default"}, {"type": "all_private_chats"}, {"type": "all_group_chats"}):
+        res = tg("setMyCommands", commands=BOT_COMMANDS, scope=scope)
+        if not res.get("ok"):
+            log("setMyCommands failed:", scope["type"], res.get("description"))
 
 
 def day_message(days, day, title):
@@ -281,26 +323,54 @@ def day_message(days, day, title):
     return f"🗓 <b>{title}, {fmt_day(day)}</b>\nГрафік ще не опубліковано. Надішлю, щойно з'явиться."
 
 
-def subscribe(state, chat_id, days, now, group=False):
+def subscribe(state, chat_id, days, now, group=False, thread=None):
     if chat_id not in state["subscribers"]:
         state["subscribers"].append(chat_id)
-    where = "для цієї групи" if group else ""
+    threads = state.setdefault("threads", {})
+    if thread:
+        threads[str(chat_id)] = thread
+    else:
+        threads.pop(str(chat_id), None)
+    where = (" в цей топік" if thread else " для цієї групи") if group else ""
     send(state, chat_id,
-         f"👋 Підписка оформлена{(' ' + where) if where else ''}: черга <b>{GROUP_LABEL}</b>, {PLACE}.\n\n"
+         f"👋 Підписка оформлена{where}: черга <b>{GROUP_LABEL}</b>, {PLACE}.\n\n"
          f"Я надсилатиму графік на завтра, щойно його опублікують, і нагадуватиму "
-         f"за 30 хв до відключення та за 30 хв до включення.\n\n{HELP}")
-    send(state, chat_id, day_message(days, now.date(), "Сьогодні"))
+         f"за 30 хв до відключення та за 30 хв до включення.\n\n{HELP}", thread)
+    send(state, chat_id, day_message(days, now.date(), "Сьогодні"), thread)
     tomorrow = now.date() + timedelta(days=1)
     if tomorrow in days:
-        send(state, chat_id, day_message(days, tomorrow, "Графік на завтра"))
+        send(state, chat_id, day_message(days, tomorrow, "Графік на завтра"), thread)
 
 
 def unsubscribe(state, chat_id):
     if chat_id in state["subscribers"]:
         state["subscribers"].remove(chat_id)
+    state.setdefault("threads", {}).pop(str(chat_id), None)
 
 
 COMMANDS = {"/start", "/stop", "/today", "/tomorrow", "/now", "/help"}
+
+
+def run_command(state, days, now, cmd, chat_id, is_group, thread):
+    today, tomorrow = now.date(), now.date() + timedelta(days=1)
+    if cmd == "/start":
+        subscribe(state, chat_id, days, now, group=is_group, thread=thread)
+    elif cmd == "/stop":
+        unsubscribe(state, chat_id)
+        send(state, chat_id, "🔕 Сповіщення вимкнено. /start — увімкнути знову.", thread, buttons=False)
+    elif cmd == "/today":
+        send(state, chat_id, day_message(days, today, "Сьогодні"), thread)
+    elif cmd == "/tomorrow":
+        send(state, chat_id, day_message(days, tomorrow, "Графік на завтра"), thread)
+    elif cmd == "/now":
+        send(state, chat_id, status_text(days, now), thread)
+    else:
+        send(state, chat_id, HELP, thread)
+
+
+def topic_id(msg):
+    """id топіка, з якого прийшло повідомлення (None — General або звичайний чат)."""
+    return msg.get("message_thread_id") if msg.get("is_topic_message") else None
 
 
 def handle_member_update(state, days, now, upd):
@@ -316,9 +386,20 @@ def handle_member_update(state, days, now, upd):
         subscribe(state, chat_id, days, now, group=True)
 
 
+def handle_callback(state, days, now, cq):
+    """Натискання інлайн-кнопки під повідомленням бота."""
+    tg("answerCallbackQuery", callback_query_id=cq["id"])
+    msg = cq.get("message") or {}
+    chat = msg.get("chat") or {}
+    if chat.get("id") and cq.get("data") in ("today", "tomorrow", "now"):
+        run_command(state, days, now, "/" + cq["data"], chat["id"],
+                    chat.get("type") in ("group", "supergroup"), topic_id(msg))
+
+
 def handle_updates(state, days, now, poll=0):
     """poll > 0 — long polling: чекає нових повідомлень до poll секунд і відповідає одразу."""
-    res = tg("getUpdates", offset=state["offset"], timeout=poll, allowed_updates=["message", "my_chat_member"])
+    res = tg("getUpdates", offset=state["offset"], timeout=poll,
+             allowed_updates=["message", "my_chat_member", "callback_query"])
     if not res.get("ok"):
         log("getUpdates failed:", res.get("description"))
         return
@@ -330,38 +411,37 @@ def handle_updates(state, days, now, poll=0):
         log(f"updates={len(res['result'])}")
     for upd in res["result"]:
         state["offset"] = upd["update_id"] + 1
-        if upd.get("my_chat_member"):
-            handle_member_update(state, days, now, upd["my_chat_member"])
-            continue
-        msg = upd.get("message") or {}
-        chat = msg.get("chat") or {}
-        chat_id, is_group = chat.get("id"), chat.get("type") in ("group", "supergroup")
-        if msg.get("migrate_to_chat_id"):
-            migrate(state, chat_id, msg["migrate_to_chat_id"])
-            continue
-        text = (msg.get("text") or "").strip()
-        if not chat_id or not text.startswith("/"):
-            continue
-        cmd, _, addressee = text.split()[0].lower().partition("@")
-        me = (state.get("bot_username") or "").lower()
-        if addressee and me and addressee != me:
-            continue  # команда для іншого бота в групі
-        if is_group and cmd not in COMMANDS:
-            continue  # у групі не реагуємо на чужі команди
-        today, tomorrow = now.date(), now.date() + timedelta(days=1)
-        if cmd == "/start":
-            subscribe(state, chat_id, days, now, group=is_group)
-        elif cmd == "/stop":
-            unsubscribe(state, chat_id)
-            send(state, chat_id, "🔕 Сповіщення вимкнено. /start — увімкнути знову.")
-        elif cmd == "/today":
-            send(state, chat_id, day_message(days, today, "Сьогодні"))
-        elif cmd == "/tomorrow":
-            send(state, chat_id, day_message(days, tomorrow, "Графік на завтра"))
-        elif cmd == "/now":
-            send(state, chat_id, status_text(days, now))
-        else:
-            send(state, chat_id, HELP)
+        try:
+            handle_update(state, days, now, upd)
+        except Exception as e:
+            log("update error:", repr(e))
+
+
+def handle_update(state, days, now, upd):
+    if upd.get("my_chat_member"):
+        return handle_member_update(state, days, now, upd["my_chat_member"])
+    if upd.get("callback_query"):
+        return handle_callback(state, days, now, upd["callback_query"])
+    msg = upd.get("message") or {}
+    chat = msg.get("chat") or {}
+    chat_id, is_group = chat.get("id"), chat.get("type") in ("group", "supergroup")
+    if msg.get("migrate_to_chat_id"):
+        return migrate(state, chat_id, msg["migrate_to_chat_id"])
+    created = msg.get("forum_topic_created")
+    if created and chat_id in state["subscribers"] and "світло" in (created.get("name") or "").lower():
+        state.setdefault("threads", {})[str(chat_id)] = msg.get("message_thread_id")
+        log("topic auto-selected", chat_id, msg.get("message_thread_id"))
+        return
+    text = (msg.get("text") or "").strip()
+    if not chat_id or not text.startswith("/"):
+        return
+    cmd, _, addressee = text.split()[0].lower().partition("@")
+    me = (state.get("bot_username") or "").lower()
+    if addressee and me and addressee != me:
+        return  # команда для іншого бота в групі
+    if is_group and cmd not in COMMANDS:
+        return  # у групі не реагуємо на чужі команди
+    run_command(state, days, now, cmd, chat_id, is_group, topic_id(msg))
 
 
 def check_schedule_changes(state, days, now):
@@ -420,7 +500,7 @@ def send_warnings(state, days, now_fn, sleep=True, lookahead=LOOKAHEAD):
         if ev["at"] <= now:
             continue
         log("warning", key)
-        broadcast(state, warning_text(ev, evs, data_end, now))
+        broadcast(state, warning_text(ev, evs, data_end, now), buttons=False)
         state["notified"][key] = ev["at"].isoformat()
         save_state(state)
     cutoff = (now_fn() - timedelta(days=2)).isoformat()
@@ -438,6 +518,10 @@ def run_loop(state, days, now_fn, duration):
     fetched_at = now_fn()
     check_schedule_changes(state, days, now_fn())
     save_state(state)
+    try:
+        setup_commands()
+    except Exception as e:
+        log("setup_commands error:", repr(e))
     log(f"loop started until {deadline:%H:%M}")
     while now_fn() < deadline:
         try:
